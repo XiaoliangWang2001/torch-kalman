@@ -11,11 +11,15 @@ class KalmanFilter(nn.Module):
 
     The model follows the standard linear-Gaussian state space model:
         x_{t+1} = A_{t} x_{t} + b_{t} + N(0, Q_{t})
-        z_{t} = C_{t} x_{t} + d_{t} + N(0, R_{t})
+        y_{t} = C_{t} x_{t} + d_{t} + N(0, R_{t})
     """
 
-    def __init__(self):
+    def __init__(self, compile_mode: bool = False):
         super().__init__()
+        self.compile_mode = compile_mode
+        if compile_mode:
+            self.compiled_filter = torch.compile(self._filter)
+            self.compiled_smooth = torch.compile(self._smooth)
 
     def _filter_predict(
         self,
@@ -98,7 +102,7 @@ class KalmanFilter(nn.Module):
 
         return kalman_gain, corrected_state_mean, corrected_state_covariance
 
-    def filter(
+    def _filter(
         self,
         observations,
         transition_matrices,
@@ -214,7 +218,7 @@ class KalmanFilter(nn.Module):
 
         return filtered_means, filtered_covs, predicted_means, predicted_covs
 
-    def smooth(
+    def _smooth(
         self,
         filtered_means,
         filtered_covs,
@@ -288,8 +292,8 @@ class KalmanFilter(nn.Module):
         mode="filter",
     ):
         if mode == "filter":
-            filtered_means, filtered_covs, predicted_means, predicted_covs = (
-                self.filter(
+            if self.compile_mode:
+                filtered_means, filtered_covs, predicted_means, predicted_covs = self.compiled_filter(
                     observations,
                     transition_matrices,
                     observation_matrices,
@@ -300,11 +304,22 @@ class KalmanFilter(nn.Module):
                     initial_state_mean,
                     initial_state_covariance,
                 )
-            )
+            else:
+                filtered_means, filtered_covs, predicted_means, predicted_covs = self._filter(
+                    observations,
+                    transition_matrices,
+                    observation_matrices,
+                    transition_covariance,
+                    observation_covariance,
+                    transition_offsets,
+                    observation_offsets,
+                    initial_state_mean,
+                    initial_state_covariance,
+                )
             return filtered_means, filtered_covs
         elif mode == "smooth":
-            filtered_means, filtered_covs, predicted_means, predicted_covs = (
-                self.filter(
+            if self.compile_mode:
+                filtered_means, filtered_covs, predicted_means, predicted_covs = self.compiled_filter(
                     observations,
                     transition_matrices,
                     observation_matrices,
@@ -315,13 +330,31 @@ class KalmanFilter(nn.Module):
                     initial_state_mean,
                     initial_state_covariance,
                 )
-            )
-            return self.smooth(
-                filtered_means,
-                filtered_covs,
-                predicted_means,
-                predicted_covs,
-                transition_matrices,
-            )
+                return self.compiled_smooth(
+                    filtered_means,
+                    filtered_covs,
+                    predicted_means,
+                    predicted_covs,
+                    transition_matrices,
+                )
+            else:
+                filtered_means, filtered_covs, predicted_means, predicted_covs = self._filter(
+                    observations,
+                    transition_matrices,
+                    observation_matrices,
+                    transition_covariance,
+                    observation_covariance,
+                    transition_offsets,
+                    observation_offsets,
+                    initial_state_mean,
+                    initial_state_covariance,
+                )
+                return self._smooth(
+                    filtered_means,
+                    filtered_covs,
+                    predicted_means,
+                    predicted_covs,
+                    transition_matrices,
+                )
         else:
             raise ValueError(f"Invalid mode: {mode}")

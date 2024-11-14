@@ -113,7 +113,7 @@ class TestKalmanFilter:
         data = setup_simple_system
 
         # Run filter
-        filtered_means, filtered_covs, predicted_means, predicted_covs = kf.filter(
+        filtered_means, filtered_covs, predicted_means, predicted_covs = kf._filter(
             observations=data["observations"],
             transition_matrices=data["transition_matrices"],
             observation_matrices=data["observation_matrices"],
@@ -151,7 +151,7 @@ class TestKalmanFilter:
         data = setup_simple_system
 
         # First run filter
-        filtered_means, filtered_covs, predicted_means, predicted_covs = kf.filter(
+        filtered_means, filtered_covs, predicted_means, predicted_covs = kf._filter(
             observations=data["observations"],
             transition_matrices=data["transition_matrices"],
             observation_matrices=data["observation_matrices"],
@@ -164,7 +164,7 @@ class TestKalmanFilter:
         )
 
         # Run smoother
-        smoothed_means, smoothed_covs = kf.smooth(
+        smoothed_means, smoothed_covs = kf._smooth(
             filtered_means=filtered_means,
             filtered_covs=filtered_covs,
             predicted_means=predicted_means,
@@ -272,6 +272,82 @@ class TestKalmanFilter:
         assert (
             observation_matrices.grad is not None
         ), "No gradients for observation matrices in smoother"
+
+    def test_compiled_filter(self, setup_simple_system):
+        """Test the compiled Kalman filter implementation."""
+        kf = KalmanFilter(compile_mode=True)
+        data = setup_simple_system
+
+        # Run filter
+        filtered_means, filtered_covs = kf.forward(
+            observations=data["observations"],
+            transition_matrices=data["transition_matrices"],
+            observation_matrices=data["observation_matrices"],
+            transition_covariance=data["transition_covariance"],
+            observation_covariance=data["observation_covariance"],
+            transition_offsets=data["transition_offsets"],
+            observation_offsets=data["observation_offsets"],
+            initial_state_mean=data["initial_state_mean"],
+            initial_state_covariance=data["initial_state_covariance"],
+            mode="filter"
+        )
+
+        # Compare with non-compiled version
+        kf_normal = KalmanFilter(compile_mode=False)
+        filtered_means_normal, filtered_covs_normal = kf_normal.forward(
+            observations=data["observations"],
+            transition_matrices=data["transition_matrices"],
+            observation_matrices=data["observation_matrices"],
+            transition_covariance=data["transition_covariance"],
+            observation_covariance=data["observation_covariance"],
+            transition_offsets=data["transition_offsets"],
+            observation_offsets=data["observation_offsets"],
+            initial_state_mean=data["initial_state_mean"],
+            initial_state_covariance=data["initial_state_covariance"],
+            mode="filter"
+        )
+
+        # Check that results are close
+        assert torch.allclose(filtered_means, filtered_means_normal, rtol=1e-4)
+        assert torch.allclose(filtered_covs, filtered_covs_normal, rtol=1e-4)
+
+    def test_compiled_smoother(self, setup_simple_system):
+        """Test the compiled Kalman smoother implementation."""
+        kf = KalmanFilter(compile_mode=True)
+        data = setup_simple_system
+
+        # Run smoother
+        smoothed_means, smoothed_covs = kf.forward(
+            observations=data["observations"],
+            transition_matrices=data["transition_matrices"],
+            observation_matrices=data["observation_matrices"],
+            transition_covariance=data["transition_covariance"],
+            observation_covariance=data["observation_covariance"],
+            transition_offsets=data["transition_offsets"],
+            observation_offsets=data["observation_offsets"],
+            initial_state_mean=data["initial_state_mean"],
+            initial_state_covariance=data["initial_state_covariance"],
+            mode="smooth"
+        )
+
+        # Compare with non-compiled version
+        kf_normal = KalmanFilter(compile_mode=False)
+        smoothed_means_normal, smoothed_covs_normal = kf_normal.forward(
+            observations=data["observations"],
+            transition_matrices=data["transition_matrices"],
+            observation_matrices=data["observation_matrices"],
+            transition_covariance=data["transition_covariance"],
+            observation_covariance=data["observation_covariance"],
+            transition_offsets=data["transition_offsets"],
+            observation_offsets=data["observation_offsets"],
+            initial_state_mean=data["initial_state_mean"],
+            initial_state_covariance=data["initial_state_covariance"],
+            mode="smooth"
+        )
+
+        # Check that results are close
+        assert torch.allclose(smoothed_means, smoothed_means_normal, rtol=1e-4)
+        assert torch.allclose(smoothed_covs, smoothed_covs_normal, rtol=1e-4)
 
 
 if __name__ == "__main__":
