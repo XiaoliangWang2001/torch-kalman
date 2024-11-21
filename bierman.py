@@ -21,9 +21,10 @@ class UDUDecomposition(nn.Module):
 
     def reconstruct(self) -> torch.Tensor:
         """Reconstruct the original matrix from UDU' decomposition"""
-        return torch.matmul(
+        UDU = torch.matmul(
             torch.matmul(self.U, torch.diag_embed(self.D)), self.U.transpose(-2, -1)
         )
+        return (UDU + UDU.transpose(-2, -1)) / 2
 
     def transpose(self, *args):
         """Return transpose of the reconstructed matrix"""
@@ -135,7 +136,7 @@ def udu(M: torch.Tensor) -> UDUDecomposition:
         UDU' representation of M
     """
     # Check symmetry
-    if not torch.allclose(M, M.transpose(-2, -1), rtol=1e-10, atol=1e-10):
+    if not torch.allclose(M, M.transpose(-2, -1), rtol=1e-5, atol=1e-8):
         raise ValueError("M must be symmetric, positive semidefinite")
 
     n = M.shape[-1]
@@ -417,6 +418,7 @@ class BiermanKalmanFilter(KalmanFilter):
             torch.einsum('...ij,...jk,...lk->...il', transition_matrix, current_cov, transition_matrix) 
             + transition_covariance
         )
+        predicted_cov = (predicted_cov + predicted_cov.transpose(-2, -1)) / 2
 
         # Convert final result to UDU form
         predicted_udu = udu(predicted_cov)
