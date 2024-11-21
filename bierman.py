@@ -54,9 +54,11 @@ class UDUTensor:
 
     def __setitem__(self, idx, value):
         if isinstance(value, UDUDecomposition):
-            U, D = value.U, value.D
+            U, D = value.U.clone(), value.D.clone()
         else:
             U, D = value
+            U = U.clone()
+            D = D.clone()
             
         # Handle input of different shape
         match len(U.shape):
@@ -139,40 +141,51 @@ def udu(M: torch.Tensor) -> UDUDecomposition:
     n = M.shape[-1]
     batch_dims = M.shape[:-2]
 
-    # Initialize U and d with better numerical precision
-    U = torch.eye(n, device=M.device, dtype=M.dtype).expand(*batch_dims, n, n).clone()
-    d = torch.zeros(*batch_dims, n, device=M.device, dtype=M.dtype)
+    # Initialize U and d (avoid clone())
+    U = torch.eye(n, device=M.device, dtype=M.dtype, requires_grad=M.requires_grad).expand(*batch_dims, n, n)
+    d = torch.zeros(*batch_dims, n, device=M.device, dtype=M.dtype, requires_grad=M.requires_grad)
 
-    # Get upper triangular part and ensure we maintain gradients
-    M_working = torch.triu(M.clone())
+    # Get upper triangular part (avoid clone())
+    M_working = torch.triu(M)
 
     # Small constant for numerical stability
     eps = torch.finfo(M.dtype).eps
 
-    # Perform Bierman's COV2UD algorithm with improved numerical stability
+    # Perform Bierman's COV2UD algorithm
     for j in range(n - 1, 0, -1):
-        d[..., j] = torch.clamp(M_working[..., j, j], min=eps)
+        # Update d (non-in-place)
+        d_new = d.clone()
+        d_new[..., j] = torch.clamp(M_working[..., j, j], min=eps)
+        d = d_new
+
         alpha = torch.where(
             d[..., j] > eps, 1.0 / d[..., j], torch.zeros_like(d[..., j])
         )
 
         for k in range(j):
             beta = M_working[..., k, j]
-            U[..., k, j] = alpha * beta
+            
+            # Update U (non-in-place)
+            U_new = U.clone()
+            U_new[..., k, j] = alpha * beta
+            U = U_new
 
-            # Fix the broadcasting issue and improve numerical stability
+            # Fix broadcasting and update M_working (non-in-place)
             beta_expanded = beta.unsqueeze(-1).expand(*batch_dims, k + 1)
             U_slice = U[..., : k + 1, j]
-
-            # Use fused multiply-add for better numerical precision
-            M_working[..., : k + 1, k] = torch.addcmul(
+            
+            M_new = M_working.clone()
+            M_new[..., : k + 1, k] = torch.addcmul(
                 M_working[..., : k + 1, k], beta_expanded, U_slice, value=-1.0
             )
+            M_working = M_new
 
-    # Handle the final diagonal element
-    d[..., 0] = torch.clamp(M_working[..., 0, 0], min=eps)
+    # Handle the final diagonal element (non-in-place)
+    d_new = d.clone()
+    d_new[..., 0] = torch.clamp(M_working[..., 0, 0], min=eps)
+    d = d_new
 
-    # Ensure symmetry in the result
+    # Ensure symmetry in the result (non-in-place)
     U = torch.triu(U)
 
     return UDUDecomposition(U, d)
@@ -186,8 +199,12 @@ class BiermanKalmanFilter(KalmanFilter):
 
     def __init__(self, compile_mode: bool = False, diagonal_only: bool = False):
         self.diagonal_only = diagonal_only
-        super().__init__(compile_mode)
-        self.udu_decompositions = nn.ModuleDict()
+        super().__init__(compile_mode=False)
+        self.compile_mode = compile_mode
+        if compile_mode:
+            self.compiled_filter = torch.compile(self.filter)
+            self.compiled_smooth = torch.compile(self.smooth)
+        
 
     def _decorrelate_observations(
         self,
@@ -267,46 +284,75 @@ class BiermanKalmanFilter(KalmanFilter):
         R: torch.Tensor,  # [batch]
         UDU: UDUDecomposition,
     ) -> tuple[UDUDecomposition, torch.Tensor]:  # Returns (UDU, k)
-        """Process a single observation using Bierman's update algorithm.
-        
-        Args:
-            h: Single row of observation matrix [batch, n_dim_state]
-            R: Single diagonal element of observation covariance [batch]
-            UDU: Current state covariance in UDU form
-        
-        Returns:
-            tuple: (Updated UDU decomposition, Kalman gain for this observation)
-        """
         batch_size = h.shape[0]
         n_dim_state = h.shape[-1]
         device = h.device
 
-        U = UDU.U.clone()  # [batch, state, state]
-        D = UDU.D.clone()  # [batch, state]
         
-        # Initial computations
-        f = torch.einsum('...i,...ij->...j', h, U)  # [batch, state]
-        g = f * D  # [batch, state]
+        f = torch.einsum('...i,...ij->...j', h, UDU.U)  # [batch, state]
+        g = f * UDU.D  # [batch, state]
         alpha = torch.einsum('...i,...i->...', f, g) + R  # [batch]
 
-        # Initialize arrays
+        # Initialize tensors
         gamma = torch.zeros(batch_size, n_dim_state, device=device)
-        U_bar = torch.zeros_like(U)
-        D_bar = torch.zeros_like(D)
+        U_bar = torch.zeros(batch_size, n_dim_state, n_dim_state, device=device)
+        D_bar = torch.zeros(batch_size, n_dim_state, device=device)
         k = torch.zeros(batch_size, n_dim_state, device=device)
 
-        # Initial values
-        gamma[..., 0] = R + g[..., 0] * f[..., 0]
-        D_bar[..., 0] = D[..., 0] * R / gamma[..., 0]
-        k[..., 0] = g[..., 0]
-        U_bar[..., 0, 0] = 1
+        # Initial values (j=0)
+        gamma = torch.cat([
+            (R + g[..., 0] * f[..., 0]).unsqueeze(-1),
+            gamma[..., 1:]
+        ], dim=-1)
+        
+        D_bar = torch.cat([
+            (UDU.D[..., 0] * R / gamma[..., 0]).unsqueeze(-1),
+            D_bar[..., 1:]
+        ], dim=-1)
+        
+        k = torch.cat([
+            g[..., 0].unsqueeze(-1),
+            k[..., 1:]
+        ], dim=-1)
+
+        # Initialize U_bar with identity in first column
+        U_bar = torch.cat([
+            torch.eye(n_dim_state, device=device)[..., :1].expand(batch_size, n_dim_state, 1),
+            U_bar[..., :, 1:]
+        ], dim=-1)
 
         # Sequential update
         for j in range(1, n_dim_state):
-            gamma[..., j] = gamma[..., j-1] + g[..., j] * f[..., j]
-            D_bar[..., j] = D[..., j] * gamma[..., j-1] / gamma[..., j]
-            U_bar[..., :, j] = U[..., :, j] - (f[..., j] / gamma[..., j-1]).unsqueeze(-1) * k
-            k = k + g[..., j].unsqueeze(-1) * U[..., :, j]
+            # Update gamma
+            new_gamma = gamma[..., j-1] + g[..., j] * f[..., j]
+            gamma = torch.cat([
+                gamma[..., :j],
+                new_gamma.unsqueeze(-1),
+                gamma[..., j+1:]
+            ], dim=-1)
+            
+            # Update D_bar
+            new_D = UDU.D[..., j] * gamma[..., j-1] / gamma[..., j]
+            D_bar = torch.cat([
+                D_bar[..., :j],
+                new_D.unsqueeze(-1),
+                D_bar[..., j+1:]
+            ], dim=-1)
+            
+            # First compute k update
+            k_update = g[..., j].unsqueeze(-1) * UDU.U[..., :, j]
+            new_k = k + k_update
+            
+            # Then update U_bar using the OLD k (not new_k)
+            new_U_col = UDU.U[..., :, j] - (f[..., j] / gamma[..., j-1]).unsqueeze(-1) * k
+            U_bar = torch.cat([
+                U_bar[..., :, :j],
+                new_U_col.unsqueeze(-1),
+                U_bar[..., :, j+1:]
+            ], dim=-1)
+            
+            # Update k for next iteration
+            k = new_k
 
         return UDUDecomposition(U_bar, D_bar), k / alpha.unsqueeze(-1)
 

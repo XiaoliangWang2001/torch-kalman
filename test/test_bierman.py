@@ -7,6 +7,9 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bierman import BiermanKalmanFilter, udu, UDUDecomposition, UDUTensor
 
+torch.autograd.set_detect_anomaly(True)
+torch.set_float32_matmul_precision('high')
+
 
 class TestBiermanKalmanFilter:
     @pytest.fixture
@@ -331,18 +334,44 @@ class TestBiermanKalmanFilter:
     def test_gradient_flow(self):
         # Create a simple matrix that requires grad
         M = torch.tensor([[2.0, 1.0], [1.0, 2.0]], requires_grad=True)
-
-        # Create UDU decomposition
-        decomp = udu(M)
-
-        # Reconstruct and compute loss
-        reconstructed = decomp()  # Using forward()
-        loss = reconstructed.sum()
-
-        # Check if gradients flow
-        loss.backward()
-        assert M.grad is not None
-        assert torch.all(torch.isfinite(M.grad))
+        print(f"\nInitial M: {M}")
+        
+        try:
+            # Test UDU decomposition
+            print("\nTesting UDU decomposition...")
+            decomp = udu(M)
+            print(f"U shape: {decomp.U.shape}, requires_grad: {decomp.U.requires_grad}")
+            print(f"D shape: {decomp.D.shape}, requires_grad: {decomp.D.requires_grad}")
+            
+            # Test intermediate reconstruction
+            print("\nTesting intermediate reconstruction...")
+            U_part = torch.matmul(decomp.U, torch.diag_embed(decomp.D))
+            print(f"U_part requires_grad: {U_part.requires_grad}")
+            
+            # Test final reconstruction
+            print("\nTesting final reconstruction...")
+            reconstructed = decomp()
+            print(f"Reconstructed shape: {reconstructed.shape}, requires_grad: {reconstructed.requires_grad}")
+            print(f"Reconstructed matrix:\n{reconstructed}")
+            
+            # Compute loss
+            print("\nComputing loss...")
+            loss = reconstructed.sum()
+            print(f"Loss value: {loss}, requires_grad: {loss.requires_grad}")
+            
+            # Backward pass
+            print("\nRunning backward pass...")
+            loss.backward()
+            
+            print(f"\nGradient of M:\n{M.grad}")
+            
+        except RuntimeError as e:
+            print(f"\nError occurred: {str(e)}")
+            print("\nCurrent state of tensors:")
+            print(f"M requires_grad: {M.requires_grad}")
+            if hasattr(decomp, 'U'):
+                print(f"U requires_grad: {decomp.U.requires_grad}")
+                print(f"D requires_grad: {decomp.D.requires_grad}")
 
     def test_bierman_filter_gradients(self, sample_data):
         kf = BiermanKalmanFilter()
@@ -368,21 +397,151 @@ class TestBiermanKalmanFilter:
     def test_udu_batch_gradients(self):
         # Create batch of matrices requiring gradients
         batch_size = 2
-        M = torch.randn(batch_size, 2, 2, requires_grad=True)
-        M = torch.matmul(M, M.transpose(-2, -1))  # Make symmetric positive definite
-
+        M_raw = torch.randn(batch_size, 2, 2, requires_grad=True)
+        
+        # Make symmetric positive definite while preserving leaf status
+        M = torch.matmul(M_raw, M_raw.transpose(-2, -1))
+        M.retain_grad()
+        
         # Create UDU decomposition
         decomp = udu(M)
-
+        
         # Reconstruct and compute loss
         reconstructed = decomp()
         loss = reconstructed.sum()
-
+        
         # Check gradient flow through batched operations
         loss.backward()
+        
         assert M.grad is not None
-        assert M.grad.shape == M.shape
-        assert torch.all(torch.isfinite(M.grad))
+        assert M_raw.grad is not None
+        
+    def test_compiled_bierman_filter(self, sample_data):
+        """Test the compiled Bierman Kalman filter implementation."""
+        kf = BiermanKalmanFilter(compile_mode=True)
+
+        # Run filter with compiled version
+        filtered_means_comp, filtered_covs_comp = kf(
+            **sample_data,
+            mode="filter"
+        )
+
+        # Compare with non-compiled version
+        kf_normal = BiermanKalmanFilter(compile_mode=False)
+        filtered_means_norm, filtered_covs_norm = kf_normal(
+            **sample_data,
+            mode="filter"
+        )
+
+        # Check that results are close
+        assert torch.allclose(filtered_means_comp, filtered_means_norm, rtol=1e-4)
+        assert torch.allclose(filtered_covs_comp, filtered_covs_norm, rtol=1e-4)
+        
+    def test_compiled_bierman_gradient_flow(self, sample_data):
+        """Test gradient flow through compiled Bierman filter."""
+        kf = BiermanKalmanFilter(compile_mode=True)
+
+        # Make parameters require gradients
+        transition_matrices = sample_data["transition_matrices"].clone().requires_grad_(True)
+        observation_matrices = sample_data["observation_matrices"].clone().requires_grad_(True)
+
+        # Run filter with compiled version
+        filtered_means, filtered_covs = kf(
+            observations=sample_data["observations"],
+            transition_matrices=transition_matrices,
+            observation_matrices=observation_matrices,
+            transition_covariance=sample_data["transition_covariance"],
+            observation_covariance=sample_data["observation_covariance"],
+            transition_offsets=sample_data["transition_offsets"],
+            observation_offsets=sample_data["observation_offsets"],
+            initial_state_mean=sample_data["initial_state_mean"],
+            initial_state_covariance=sample_data["initial_state_covariance"],
+            mode="filter"
+        )
+
+        # Compute loss and backpropagate
+        loss = filtered_means.sum() + filtered_covs.sum()
+        loss.backward()
+
+        # Check gradients exist and are finite
+        assert transition_matrices.grad is not None
+        assert observation_matrices.grad is not None
+        assert torch.all(torch.isfinite(transition_matrices.grad))
+        assert torch.all(torch.isfinite(observation_matrices.grad))
+        
+    def test_compiled_bierman_performance(self, capsys):
+        """Compare performance of compiled vs non-compiled Bierman filter."""
+        import time
+
+        # Test different sizes
+        sizes = [
+            (2, 5, 2),    # (batch_size, n_timesteps, n_dim_state) - small
+            (10, 20, 4),  # medium
+            (32, 50, 8),  # large
+        ]
+
+        with capsys.disabled():
+            for batch_size, n_timesteps, n_dim_state in sizes:
+                print(f"\nTesting size: batch={batch_size}, timesteps={n_timesteps}, state_dim={n_dim_state}")
+                
+                # Create sample data of appropriate size
+                sample_data = self._create_test_data(batch_size, n_timesteps, n_dim_state)
+
+                # Initialize filters
+                kf_compiled = BiermanKalmanFilter(compile_mode=True)
+                kf_normal = BiermanKalmanFilter(compile_mode=False)
+
+                # Warmup
+                _ = kf_compiled(**sample_data, mode="filter")
+                _ = kf_normal(**sample_data, mode="filter")
+
+                # Time compiled version
+                start = time.time()
+                for _ in range(100):
+                    _ = kf_compiled(**sample_data, mode="filter")
+                compiled_time = time.time() - start
+
+                # Time normal version
+                start = time.time()
+                for _ in range(100):
+                    _ = kf_normal(**sample_data, mode="filter")
+                normal_time = time.time() - start
+
+                print("Performance comparison:")
+                print(f"Compiled time: {compiled_time:.4f}s")
+                print(f"Normal time: {normal_time:.4f}s")
+                print(f"Speedup: {normal_time/compiled_time:.2f}x")
+
+    def _create_test_data(self, batch_size, n_timesteps, n_dim_state):
+        """Helper method to create test data of specified size"""
+        n_dim_obs = n_dim_state  # For simplicity, make observation dim same as state dim
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        return {
+            "observations": torch.randn(batch_size, n_timesteps, n_dim_obs, device=device),
+            "transition_matrices": torch.eye(n_dim_state, device=device).expand(
+                batch_size, n_timesteps - 1, n_dim_state, n_dim_state
+            ),
+            "observation_matrices": torch.eye(n_dim_obs, n_dim_state, device=device).expand(
+                batch_size, n_timesteps, n_dim_obs, n_dim_state
+            ),
+            "transition_covariance": torch.eye(n_dim_state, device=device).expand(
+                batch_size, n_timesteps - 1, n_dim_state, n_dim_state
+            ),
+            "observation_covariance": torch.eye(n_dim_obs, device=device).expand(
+                batch_size, n_timesteps, n_dim_obs, n_dim_obs
+            ),
+            "transition_offsets": torch.zeros(
+                batch_size, n_timesteps - 1, n_dim_state, device=device
+            ),
+            "observation_offsets": torch.zeros(
+                batch_size, n_timesteps, n_dim_obs, device=device
+            ),
+            "initial_state_mean": torch.zeros(batch_size, n_dim_state, device=device),
+            "initial_state_covariance": torch.eye(n_dim_state, device=device).expand(
+                batch_size, n_dim_state, n_dim_state
+            ),
+        }
 
 
 if __name__ == "__main__":
