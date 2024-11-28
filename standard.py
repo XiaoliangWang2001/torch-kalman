@@ -28,6 +28,8 @@ class KalmanFilter(nn.Module):
         transition_offset,
         current_state_mean,
         current_state_covariance,
+        control,
+        control_matrix,
     ):
         """Predict next state distribution given current state distribution."""
         # Ensure current_state_mean has correct shape for matmul
@@ -37,6 +39,7 @@ class KalmanFilter(nn.Module):
         # Predict next state mean
         predicted_state_mean = (
             torch.matmul(transition_matrix, current_state_mean).squeeze(-1)
+            + torch.matmul(control_matrix, control).squeeze(-1)
             + transition_offset
         )
 
@@ -105,7 +108,9 @@ class KalmanFilter(nn.Module):
     def _filter(
         self,
         observations,
+        controls,
         transition_matrices,
+        control_matrices,
         observation_matrices,
         transition_covariance,
         observation_covariance,
@@ -120,8 +125,12 @@ class KalmanFilter(nn.Module):
         ----------
         observations : [batch_size, n_timesteps, n_dim_obs] tensor
             Observations for times [0...n_timesteps-1]
+        controls : [batch_size, n_timesteps-1, n_dim_control] tensor
+            Controls for times [0...n_timesteps-2]
         transition_matrices : [batch_size, n_timesteps-1, n_dim_state, n_dim_state] tensor
             State transition matrices
+        control_matrices : [batch_size, n_timesteps-1, n_dim_control, n_dim_state] tensor
+            Control matrices
         observation_matrices : [batch_size, n_timesteps, n_dim_obs, n_dim_state] tensor
             Observation matrices
         transition_covariance : [batch_size, n_timesteps-1, n_dim_state, n_dim_state] tensor
@@ -204,6 +213,8 @@ class KalmanFilter(nn.Module):
                     transition_offsets[:, t],
                     filtered_means[:, t],
                     filtered_covs[:, t],
+                    controls[:, t],
+                    control_matrices[:, t],
                 )
                 predicted_means = torch.where(
                     (time_indices == t + 1).view(1, -1, 1),
@@ -256,8 +267,12 @@ class KalmanFilter(nn.Module):
             )
 
             # Compute smoothed mean
-            mean_diff = (smoothed_means[:, t + 1] - predicted_means[:, t + 1]).unsqueeze(-1)
-            smoothed_t = filtered_means[:, t] + torch.matmul(gain, mean_diff).squeeze(-1)
+            mean_diff = (
+                smoothed_means[:, t + 1] - predicted_means[:, t + 1]
+            ).unsqueeze(-1)
+            smoothed_t = filtered_means[:, t] + torch.matmul(gain, mean_diff).squeeze(
+                -1
+            )
             smoothed_means = torch.where(
                 (time_indices == t).view(1, -1, 1),
                 smoothed_t.unsqueeze(1),
@@ -267,8 +282,7 @@ class KalmanFilter(nn.Module):
             # Compute smoothed covariance
             cov_diff = smoothed_covs[:, t + 1] - predicted_covs[:, t + 1]
             smoothed_cov_t = filtered_covs[:, t] + torch.matmul(
-                torch.matmul(gain, cov_diff),
-                gain.transpose(-2, -1)
+                torch.matmul(gain, cov_diff), gain.transpose(-2, -1)
             )
             smoothed_covs = torch.where(
                 (time_indices == t).view(1, -1, 1, 1),
@@ -277,17 +291,57 @@ class KalmanFilter(nn.Module):
             )
 
         return smoothed_means, smoothed_covs
-    
-    def filter(self, observations, transition_matrices, observation_matrices, transition_covariance, observation_covariance, transition_offsets, observation_offsets, initial_state_mean, initial_state_covariance):
-        return self._filter(observations, transition_matrices, observation_matrices, transition_covariance, observation_covariance, transition_offsets, observation_offsets, initial_state_mean, initial_state_covariance)
 
-    def smooth(self, filtered_means, filtered_covs, predicted_means, predicted_covs, transition_matrices):
-        return self._smooth(filtered_means, filtered_covs, predicted_means, predicted_covs, transition_matrices)    
+    def filter(
+        self,
+        observations,
+        controls,
+        transition_matrices,
+        control_matrices,
+        observation_matrices,
+        transition_covariance,
+        observation_covariance,
+        transition_offsets,
+        observation_offsets,
+        initial_state_mean,
+        initial_state_covariance,
+    ):
+        return self._filter(
+            observations,
+            controls,
+            transition_matrices,
+            control_matrices,
+            observation_matrices,
+            transition_covariance,
+            observation_covariance,
+            transition_offsets,
+            observation_offsets,
+            initial_state_mean,
+            initial_state_covariance,
+        )
+
+    def smooth(
+        self,
+        filtered_means,
+        filtered_covs,
+        predicted_means,
+        predicted_covs,
+        transition_matrices,
+    ):
+        return self._smooth(
+            filtered_means,
+            filtered_covs,
+            predicted_means,
+            predicted_covs,
+            transition_matrices,
+        )
 
     def forward(
         self,
         observations,
+        controls,
         transition_matrices,
+        control_matrices,
         observation_matrices,
         transition_covariance,
         observation_covariance,
@@ -299,42 +353,54 @@ class KalmanFilter(nn.Module):
     ):
         if mode == "filter":
             if self.compile_mode:
-                filtered_means, filtered_covs, predicted_means, predicted_covs = self.compiled_filter(
-                    observations,
-                    transition_matrices,
-                    observation_matrices,
-                    transition_covariance,
-                    observation_covariance,
-                    transition_offsets,
-                    observation_offsets,
-                    initial_state_mean,
-                    initial_state_covariance,
+                filtered_means, filtered_covs, predicted_means, predicted_covs = (
+                    self.compiled_filter(
+                        observations,
+                        controls,
+                        transition_matrices,
+                        control_matrices,
+                        observation_matrices,
+                        transition_covariance,
+                        observation_covariance,
+                        transition_offsets,
+                        observation_offsets,
+                        initial_state_mean,
+                        initial_state_covariance,
+                    )
                 )
             else:
-                filtered_means, filtered_covs, predicted_means, predicted_covs = self.filter(
-                    observations,
-                    transition_matrices,
-                    observation_matrices,
-                    transition_covariance,
-                    observation_covariance,
-                    transition_offsets,
-                    observation_offsets,
-                    initial_state_mean,
-                    initial_state_covariance,
+                filtered_means, filtered_covs, predicted_means, predicted_covs = (
+                    self.filter(
+                        observations,
+                        controls,
+                        transition_matrices,
+                        control_matrices,
+                        observation_matrices,
+                        transition_covariance,
+                        observation_covariance,
+                        transition_offsets,
+                        observation_offsets,
+                        initial_state_mean,
+                        initial_state_covariance,
+                    )
                 )
             return filtered_means, filtered_covs
         elif mode == "smooth":
             if self.compile_mode:
-                filtered_means, filtered_covs, predicted_means, predicted_covs = self.compiled_filter(
-                    observations,
-                    transition_matrices,
-                    observation_matrices,
-                    transition_covariance,
-                    observation_covariance,
-                    transition_offsets,
-                    observation_offsets,
-                    initial_state_mean,
-                    initial_state_covariance,
+                filtered_means, filtered_covs, predicted_means, predicted_covs = (
+                    self.compiled_filter(
+                        observations,
+                        controls,
+                        transition_matrices,
+                        control_matrices,
+                        observation_matrices,
+                        transition_covariance,
+                        observation_covariance,
+                        transition_offsets,
+                        observation_offsets,
+                        initial_state_mean,
+                        initial_state_covariance,
+                    )
                 )
                 return self.compiled_smooth(
                     filtered_means,
@@ -344,16 +410,20 @@ class KalmanFilter(nn.Module):
                     transition_matrices,
                 )
             else:
-                filtered_means, filtered_covs, predicted_means, predicted_covs = self.filter(
-                    observations,
-                    transition_matrices,
-                    observation_matrices,
-                    transition_covariance,
-                    observation_covariance,
-                    transition_offsets,
-                    observation_offsets,
-                    initial_state_mean,
-                    initial_state_covariance,
+                filtered_means, filtered_covs, predicted_means, predicted_covs = (
+                    self.filter(
+                        observations,
+                        controls,
+                        transition_matrices,
+                        control_matrices,
+                        observation_matrices,
+                        transition_covariance,
+                        observation_covariance,
+                        transition_offsets,
+                        observation_offsets,
+                        initial_state_mean,
+                        initial_state_covariance,
+                    )
                 )
                 return self.smooth(
                     filtered_means,
